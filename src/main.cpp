@@ -1,6 +1,11 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <AS5600.h>
+//#include <AS5600.h>
+void checkMagnetPresence();
+void ReadRawAngle();
+void correctAngle();
+void checkQuadrant();
+void refreshDisplay();
 
 #define AS5600_ADDR 0x36  // Default I2C address for AS5600
 
@@ -10,338 +15,219 @@
 const int sdaPin = 21;
 const int sclPin = 18;
 
-void printMenu();
-/****************************************************
-FILE:  AMS_5600_example
+float OLEDTimer = 0;
 
-Author: Tom Denton
-www.ams.com
-Date: 15 Dec 2014
-Version 1.00
+//---------------------------------------------------------------------------
+//Magnetic sensor things
+int magnetStatus = 0; //value of the status register (MD, ML, MH)
 
-Description:  AS5600 "Potuino" demonstration application
+int lowbyte; //raw angle 7:0
+word highbyte; //raw angle 7:0 and 11:8
+int rawAngle; //final raw angle 
+float degAngle; //raw angle in degrees (360/4096 * [value between 0-4095])
 
-AMS5600 Programming Sketch
-/***************************************************/
+int quadrantNumber, previousquadrantNumber; //quadrant IDs
+float numberofTurns = 0; //number of turns
+float correctedAngle = 0; //tared angle - based on the startup value
+float startAngle = 0; //starting angle
+float totalAngle = 0; //total absolute angular displacement
+float previoustotalAngle = 0; //for the display printing
 
-#include <Wire.h>
-#include "AS5600.h"
-#define ARDUINO_SAMD_VARIANT_COMPLIANCE
-#define SerialUSB Serial
-#ifdef ARDUINO_SAMD_VARIANT_COMPLIANCE
-  #define SERIAL SerialUSB
-  #define SYS_VOL   3.3
-#else
-  #define SERIAL Serial
-  #define SYS_VOL   5
-#endif
+void setup()
+{
+  Serial.begin(115200); //start serial - tip: don't use serial if you don't need it (speed considerations)
+  Wire.begin(sdaPin, sclPin); //start i2C  
+	Wire.setClock(800000L); //fast clock
 
-String lastResponse;
-String noMagnetStr = "Error: magnet not detected";
+  //checkMagnetPresence(); //check the magnet (blocks until magnet is found)
 
-AMS_5600 ams5600;
+  ReadRawAngle(); //make a reading so the degAngle gets updated
+  startAngle = degAngle; //update startAngle with degAngle - for taring
 
-/*******************************************************
-/* function: setup
-/* In: none
-/* Out: none
-/* Description: called by system at startup
-/*******************************************************/
-void setup(){
- SERIAL.begin(115200);
- Wire.begin(sdaPin, sclPin);
- printMenu();
+
+  Serial.println("Welcome!"); //print a welcome message  
+  Serial.println("AS5600"); //print a welcome message
+  delay(3000);
+	OLEDTimer = millis(); //start the timer
+  
 }
 
-/*******************************************************
-/* function: printMenu
-/* In: none
-/* Out: none
-/* Description: prints menu options and result of last
-/* command
-/*******************************************************/
-void printMenu()
+void loop()
+{    
+    ReadRawAngle(); //ask the value from the sensor
+    correctAngle(); //tare the value
+    checkQuadrant(); //check quadrant, check rotations, check absolute angular position
+    refreshDisplay();
+    //delay(100); //wait a little - adjust it for "better resolution"
+
+}
+
+void ReadRawAngle()
+{ 
+  //7:0 - bits
+  Wire.beginTransmission(0x36); //connect to the sensor
+  Wire.write(0x0D); //figure 21 - register map: Raw angle (7:0)
+  Wire.endTransmission(); //end transmission
+  Wire.requestFrom(0x36, 1); //request from the sensor
+  
+  while(Wire.available() == 0); //wait until it becomes available 
+  lowbyte = Wire.read(); //Reading the data after the request
+ 
+  //11:8 - 4 bits
+  Wire.beginTransmission(0x36);
+  Wire.write(0x0C); //figure 21 - register map: Raw angle (11:8)
+  Wire.endTransmission();
+  Wire.requestFrom(0x36, 1);
+  
+  while(Wire.available() == 0);  
+  highbyte = Wire.read();
+  
+  //4 bits have to be shifted to its proper place as we want to build a 12-bit number
+  highbyte = highbyte << 8; //shifting to left
+  //What is happening here is the following: The variable is being shifted by 8 bits to the left:
+  //Initial value: 00000000|00001111 (word = 16 bits or 2 bytes)
+  //Left shifting by eight bits: 00001111|00000000 so, the high byte is filled in
+  
+  //Finally, we combine (bitwise OR) the two numbers:
+  //High: 00001111|00000000
+  //Low:  00000000|00001111
+  //      -----------------
+  //H|L:  00001111|00001111
+  rawAngle = highbyte | lowbyte; //int is 16 bits (as well as the word)
+
+  //We need to calculate the angle:
+  //12 bit -> 4096 different levels: 360° is divided into 4096 equal parts:
+  //360/4096 = 0.087890625
+  //Multiply the output of the encoder with 0.087890625
+  degAngle = rawAngle * 0.087890625; 
+  
+  //Serial.print("Deg angle: ");
+  //Serial.println(degAngle, 2); //absolute position of the encoder within the 0-360 circle
+  
+}
+
+void correctAngle()
 {
-  for(int i =0; i<20;i++)
-    SERIAL.println();
-  SERIAL.println("AS5600 SERIAL Interface Program");
-  SERIAL.println("");
-  if(lastResponse.length()>0)
+  //recalculate angle
+  correctedAngle = degAngle - startAngle; //this tares the position
+
+  if(correctedAngle < 0) //if the calculated angle is negative, we need to "normalize" it
   {
-    SERIAL.println(lastResponse);
-    SERIAL.println("");
-  }
-  SERIAL.print("1 - Set start position\t|  "); SERIAL.println(" 7 - get raw angle");
-  SERIAL.print("2 - Set end position\t|  ");   SERIAL.println(" 8 - get scaled angle");
-  SERIAL.print("3 - Set max angle range\t|  ");  SERIAL.println(" 9 - detect magnet");
-  SERIAL.print("4 - Get max angle range\t|  ");  SERIAL.println("10 - get magnet strength");
-  SERIAL.print("5 - Get start position \t|  ");     SERIAL.println("11 - get automatic gain conrol");
-  SERIAL.println("6 - get end position \t|  ");
-  SERIAL.println();
-  SERIAL.print("Number of burns remaining: "); SERIAL.println(String(3 - ams5600.getBurnCount()));
-  SERIAL.println("96 - Burn Angle");
-  SERIAL.println("98 - Burn Settings (one time)");
-}
-
-/*******************************************************
-/* Function: convertRawAngleToDegrees
-/* In: angle data from AMS_5600::getRawAngle
-/* Out: human readable degrees as float
-/* Description: takes the raw angle and calculates
-/* float value in degrees.
-/*******************************************************/
-float convertRawAngleToDegrees(word newAngle)
-{
-  /* Raw data reports 0 - 4095 segments, which is 0.087 of a degree */
-  float retVal = newAngle * 0.087890625;
-  return retVal;
-}
-
-/*******************************************************
-/* Function: convertScaledAngleToDegrees
-/* In: angle data from AMS_5600::getScaledAngle
-/* Out: human readable degrees as float
-/* Description: takes the scaled angle and calculates
-/* float value in degrees.
-/*******************************************************/
-float convertScaledAngleToDegrees(word newAngle)
-{
-  word startPos = ams5600.getStartPosition();
-  word endPos = ams5600.getEndPosition();
-  word maxAngle = ams5600.getMaxAngle();
-
-  float multipler = 0;
-
-  /* max angle and end position are mutually exclusive*/
-  if(maxAngle >0)
-  {
-    if(startPos == 0)
-      multipler = (maxAngle*0.087890625)/4096;
-    else  /*startPos is set to something*/
-      multipler = ((maxAngle*0.087890625)-(startPos * 0.087890625))/4096;
+  correctedAngle = correctedAngle + 360; //correction for negative numbers (i.e. -15 becomes +345)
   }
   else
   {
-    if((startPos == 0) && (endPos == 0))
-      multipler = 0.087890625;
-    else if ((startPos > 0 ) && (endPos == 0))
-      multipler = ((360 * 0.087890625) - (startPos * 0.087890625)) / 4096;
-    else if ((startPos == 0 ) && (endPos > 0))
-      multipler = (endPos*0.087890625) / 4096;
-    else if ((startPos > 0 ) && (endPos > 0))
-      multipler = ((endPos*0.087890625)-(startPos * 0.087890625))/ 4096;
+    //do nothing
   }
-  return (newAngle * multipler);
+  //Serial.print("Corrected angle: ");
+  //Serial.println(correctedAngle, 2); //print the corrected/tared angle  
 }
 
-/*******************************************************
-/* Function: burnAngle
-/* In: none
-/* Out: human readable string of success or failure
-/* Description: attempts to burn angle data to AMS5600
-/*******************************************************/
-String burnAngle()
+void checkQuadrant()
 {
-  int burnResult = ams5600.burnAngle();
-  String returnStr = "Burn angle error: ";
+  /*
+  //Quadrants:
+  4  |  1
+  ---|---
+  3  |  2
+  */
 
-  switch (burnResult)
+  //Quadrant 1
+  if(correctedAngle >= 0 && correctedAngle <=90)
   {
-    case 1:
-      returnStr = "Burn angle success";
-      break;
-    case -1:
-      returnStr += "no magnet detected";
-      break;
-    case -2:
-      returnStr += "no more burns left";
-      break;
-    case -3:
-      returnStr += "no positions set";
-      break;
-    default:
-      returnStr += "unknown";
-      break;
+    quadrantNumber = 1;
   }
-  return returnStr;
+
+  //Quadrant 2
+  if(correctedAngle > 90 && correctedAngle <=180)
+  {
+    quadrantNumber = 2;
+  }
+
+  //Quadrant 3
+  if(correctedAngle > 180 && correctedAngle <=270)
+  {
+    quadrantNumber = 3;
+  }
+
+  //Quadrant 4
+  if(correctedAngle > 270 && correctedAngle <360)
+  {
+    quadrantNumber = 4;
+  }
+  //Serial.print("Quadrant: ");
+  //Serial.println(quadrantNumber); //print our position "quadrant-wise"
+
+  if(quadrantNumber != previousquadrantNumber) //if we changed quadrant
+  {
+    if(quadrantNumber == 1 && previousquadrantNumber == 4)
+    {
+      numberofTurns++; // 4 --> 1 transition: CW rotation
+    }
+
+    if(quadrantNumber == 4 && previousquadrantNumber == 1)
+    {
+      numberofTurns--; // 1 --> 4 transition: CCW rotation
+    }
+    //this could be done between every quadrants so one can count every 1/4th of transition
+
+    previousquadrantNumber = quadrantNumber;  //update to the current quadrant
+  
+  }  
+  //Serial.print("Turns: ");
+  //Serial.println(numberofTurns,0); //number of turns in absolute terms (can be negative which indicates CCW turns)  
+
+  //after we have the corrected angle and the turns, we can calculate the total absolute position
+  totalAngle = (numberofTurns*360) + correctedAngle; //number of turns (+/-) plus the actual angle within the 0-360 range
+  //Serial.print("Total angle: ");
+  //Serial.println(totalAngle, 2); //absolute position of the motor expressed in degree angles, 2 digits
 }
 
-/*******************************************************
-/* Function: burnMaxAngleAndConfig
-/* In: none
-/* Out: human readable string of sucess or failure
-/* Description: attempts to burn max angle and config data
-/* to AMS5600
-/*******************************************************/
-String burnMaxAngleAndConfig()
-{
-  int burnResult = ams5600.burnMaxAngleAndConfig();
-  String retStr = "Burn max angle and config error: ";
+void checkMagnetPresence()
+{  
+  //This function runs in the setup() and it locks the MCU until the magnet is not positioned properly
 
-  switch(burnResult)
+  while((magnetStatus & 32) != 32) //while the magnet is not adjusted to the proper distance - 32: MD = 1
   {
-    case 1:
-      retStr = "Burn max angle and config success";
-      break;
-    case -1:
-      retStr += "chip has been burned once already";
-      break;
-    case -2:
-      retStr += "max angle less than 18 degrees";
-      break;
-    default:
-      retStr += "unknown";
-      break;
-  }
-  return retStr;
+    magnetStatus = 0; //reset reading
+
+    Wire.beginTransmission(0x36); //connect to the sensor
+    Wire.write(0x0B); //figure 21 - register map: Status: MD ML MH
+    Wire.endTransmission(); //end transmission
+    Wire.requestFrom(0x36, 1); //request from the sensor
+
+    while(Wire.available() == 0); //wait until it becomes available 
+    magnetStatus = Wire.read(); //Reading the data after the request
+
+    //Serial.print("Magnet status: ");
+    //Serial.println(magnetStatus, BIN); //print it in binary so you can compare it to the table (fig 21)      
+  }      
+  
+  //Status register output: 0 0 MD ML MH 0 0 0  
+  //MH: Too strong magnet - 100111 - DEC: 39 
+  //ML: Too weak magnet - 10111 - DEC: 23     
+  //MD: OK magnet - 110111 - DEC: 55
+
+  //Serial.println("Magnet found!");
+  //delay(1000);  
 }
 
-/*******************************************************
-/* Function: loop
-/* In: none
-/* Out: none
-/* Description: main program loop
-/*******************************************************/
-void loop()
+void refreshDisplay()
 {
-
-  if (SERIAL.available() > 0)
-  {
-    char incomingByteBuffer[5] = {0};
-    char incomingByte = 0;
-
-    incomingByteBuffer[0] = NULL;
-    incomingByteBuffer[1] = NULL;
-
-    SERIAL.readBytes(incomingByteBuffer,2);
-
-    if ((incomingByteBuffer[0] >= 48) && (incomingByteBuffer[0] < 60))
+  if (millis() - OLEDTimer > 100) //chech if we will update at every 100 ms
+	{ 
+    if(totalAngle != previoustotalAngle) //if there's a change in the position*
     {
-      incomingByte = incomingByteBuffer[0] - 48;
+        
+        Serial.println(totalAngle); //print the new absolute position
+        OLEDTimer = millis(); //reset timer 	
+        previoustotalAngle = totalAngle; //update the previous value
     }
-
-    if ((incomingByteBuffer[1] >= 48) && (incomingByteBuffer[1] < 60))
-    {
-      incomingByte *=10;
-      incomingByte += incomingByteBuffer[1] - 48;
-    }
-
-
-    switch (incomingByte)
-    {
-      case 1:
-      {
-        if(ams5600.detectMagnet()==1)
-          lastResponse = ("Start angle set to = "+String(convertRawAngleToDegrees(ams5600.setStartPosition()), DEC));  //Print Raw Angle Value
-        else
-          lastResponse = noMagnetStr;
-      }
-      break;
-
-      case 2:
-      {
-        if(ams5600.detectMagnet()==1)
-          lastResponse = ("End angle set to = "+String(convertRawAngleToDegrees(ams5600.setEndPosition()), DEC));
-        else
-          lastResponse = noMagnetStr;
-      }
-      break;
-
-      case 3:
-      {
-        if(ams5600.detectMagnet()==1)
-          lastResponse = ("Max angle range set to = "+String(convertRawAngleToDegrees(ams5600.setMaxAngle()), DEC));
-        else
-          lastResponse = noMagnetStr;
-      }
-      break;
-
-      case 4:
-      {
-        lastResponse = ("Max angle range= "+String(convertRawAngleToDegrees(ams5600.getMaxAngle()), DEC));
-      }
-      break;
-
-      case 5:
-      {
-        lastResponse = ("Start angle = "+String(convertRawAngleToDegrees(ams5600.getStartPosition()), DEC));
-      }
-      break;
-
-      case 6:
-      {
-        lastResponse = "End angle = " + String(convertRawAngleToDegrees(ams5600.getEndPosition()),DEC);
-      }
-      break;
-
-      case 7:
-      {
-        lastResponse = "Raw angle = "+ String(convertRawAngleToDegrees(ams5600.getRawAngle()),DEC);
-      }
-      break;
-
-      case 8:
-      {
-        lastResponse = "Scaled angle = "+String(convertScaledAngleToDegrees(ams5600.getScaledAngle()),DEC);
-      }
-      break;
-
-      case 9:
-      {
-        if(ams5600.detectMagnet()==1)
-          lastResponse = "Magnet detected";
-        else
-          lastResponse = noMagnetStr;
-      }
-      break;
-
-      case 10:
-      {
-        lastResponse = "Magnet strength ";
-        if(ams5600.detectMagnet()==1)
-        {
-          int magStrength = ams5600.getMagnetStrength();
-
-          if(magStrength == 1)
-            lastResponse += "is weak";
-          else if(magStrength == 2){
-            lastResponse += "is acceptable. ";
-            lastResponse += "Current Magnitude: ";
-            lastResponse += ams5600.getMagnitude();
-          }
-          else if (magStrength == 3)
-            lastResponse += "is to strong";
-        }
-        else
-          lastResponse = noMagnetStr;
-      }
-      break;
-
-      case 11:
-      {
-         lastResponse = "Automatic Gain Control = " + String(ams5600.getAgc(),DEC);
-      }
-      break;
-
-      case 96:
-      {
-          lastResponse = burnAngle();
-      }
-      break;
-
-      case 98:
-      {
-          lastResponse = burnMaxAngleAndConfig();
-      }
-      break;
-
-      default:
-      {
-          lastResponse = "Invalid Entry";
-      }
-      break;
-    }
-    /*end of menu processing */
-    printMenu();
-  }
+	}
+	else
+	{
+		//skip
+	}
+  //*idea: you can define a certain tolerance for the angle so the screen will not flicker
+  //when there is a 0.08 change in the angle (sometimes the sensor reads uncertain values)
 }
